@@ -22,6 +22,11 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import {
+  handleCoexistenceChange,
+  isCoexistenceField,
+  type CoexistenceValue,
+} from '@/lib/whatsapp/coexistence'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -290,6 +295,46 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const value = change.value
 
+      // Coexistence (`smb_message_echoes`, `history`,
+      // `smb_app_state_sync`). Sent only for a number that stayed live
+      // in the WhatsApp Business app alongside the Cloud API. These
+      // carry neither `messages` nor `statuses`, so they have to be
+      // routed before both branches below.
+      if (isCoexistenceField(change.field)) {
+        const coexValue = change.value as unknown as CoexistenceValue
+        const coexConfig = await resolveConfigForPhoneNumber(
+          coexValue.metadata?.phone_number_id
+        )
+        if (!coexConfig) continue
+
+        await handleCoexistenceChange(
+          { field: change.field, value: coexValue },
+          {
+            accountId: coexConfig.account_id,
+            configOwnerUserId: coexConfig.user_id,
+            configId: coexConfig.id,
+            accessToken: decrypt(coexConfig.access_token),
+            mirrorMedia: coexConfig.mirror_inbound_media !== false,
+          },
+          {
+            db: supabaseAdmin(),
+            findOrCreateContact,
+            findOrCreateConversation,
+            // Echoes and history rows use the same content envelope as
+            // an inbound message, but the coexistence module is typed
+            // against its own shape so it stays testable without the
+            // route's full message union.
+            parseContent: (message, accessToken, mirror) =>
+              parseMessageContent(
+                message as unknown as WhatsAppMessage,
+                accessToken,
+                mirror
+              ),
+          }
+        )
+        continue
+      }
+
       // Handle status updates
       if (value.statuses) {
         for (const status of value.statuses) {
@@ -300,44 +345,10 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       // Handle incoming messages
       if (!value.messages || !value.contacts) continue
 
-      const phoneNumberId = value.metadata.phone_number_id
-
-      // Find user's config by phone_number_id. `.single()` returns
-      // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
-      // operators see the real cause in logs. ≥2 rows shouldn't happen
-      // post-migration 013 (UNIQUE constraint), but a row created
-      // before the constraint, or a race, would still surface here.
-      const { data: configRows, error: configError } = await supabaseAdmin()
-        .from('whatsapp_config')
-        .select('*')
-        .eq('phone_number_id', phoneNumberId)
-
-      if (configError) {
-        console.error(
-          'Error fetching whatsapp_config for phone_number_id:',
-          phoneNumberId,
-          configError
-        )
-        continue
-      }
-
-      if (!configRows || configRows.length === 0) {
-        console.error('No config found for phone_number_id:', phoneNumberId)
-        continue
-      }
-
-      if (configRows.length > 1) {
-        console.error(
-          `Multiple configs (${configRows.length}) found for phone_number_id:`,
-          phoneNumberId,
-          '— inbound message dropped. Resolve duplicates so each number maps to a single account.',
-          'Account owners:',
-          configRows.map((r: { account_id: string; user_id: string }) => `${r.account_id} (admin ${r.user_id})`)
-        )
-        continue
-      }
-
-      const config = configRows[0]
+      const config = await resolveConfigForPhoneNumber(
+        value.metadata.phone_number_id
+      )
+      if (!config) continue
 
       const decryptedAccessToken = decrypt(config.access_token)
 
@@ -648,6 +659,77 @@ async function handleReaction(
   if (upsertError) {
     console.error('[webhook] reaction upsert failed:', upsertError.message)
   }
+}
+
+/**
+ * The `whatsapp_config` columns the webhook actually reads. The lookup
+ * does `select('*')`, so the index signature keeps the rest reachable
+ * without restating a schema that lives in the migrations.
+ */
+interface WhatsAppConfigRow {
+  id: string
+  account_id: string
+  user_id: string
+  access_token: string
+  phone_number_id: string
+  /** Migration 039. Undefined on a row read before it landed. */
+  mirror_inbound_media?: boolean
+  [key: string]: unknown
+}
+
+/**
+ * Resolve the `whatsapp_config` row that owns a phone_number_id.
+ *
+ * `.single()` returns PGRST116 for both 0 rows AND >=2 rows —
+ * distinguish them so operators see the real cause in logs. >=2 rows
+ * shouldn't happen post-migration 013 (UNIQUE constraint), but a row
+ * created before the constraint, or a race, would still surface here.
+ *
+ * Returns null when the delivery cannot be attributed; every caller
+ * drops the delivery in that case.
+ */
+async function resolveConfigForPhoneNumber(
+  phoneNumberId: string | undefined
+): Promise<WhatsAppConfigRow | null> {
+  if (!phoneNumberId) {
+    console.error('[webhook] delivery carries no phone_number_id; dropped')
+    return null
+  }
+
+  const { data: configRows, error: configError } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('*')
+    .eq('phone_number_id', phoneNumberId)
+
+  if (configError) {
+    console.error(
+      'Error fetching whatsapp_config for phone_number_id:',
+      phoneNumberId,
+      configError
+    )
+    return null
+  }
+
+  if (!configRows || configRows.length === 0) {
+    console.error('No config found for phone_number_id:', phoneNumberId)
+    return null
+  }
+
+  if (configRows.length > 1) {
+    console.error(
+      `Multiple configs (${configRows.length}) found for phone_number_id:`,
+      phoneNumberId,
+      '— delivery dropped. Resolve duplicates so each number maps to a single account.',
+      'Account owners:',
+      configRows.map(
+        (r: { account_id: string; user_id: string }) =>
+          `${r.account_id} (admin ${r.user_id})`
+      )
+    )
+    return null
+  }
+
+  return configRows[0]
 }
 
 async function processMessage(
